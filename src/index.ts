@@ -1,11 +1,11 @@
 import fs from 'fs';
 import https from 'https';
 import WS from './ws';
-import { PORT, PEM_CERT, PEM_KEY, INTERVAL_CLIENT_CHECK, INTERVAL_ROOM_UPDATE } from './common/config';
-import { ClientEvent, ClientNewRoom, CientJoinRoom, ClientMessage, ClientSync, ClientUserUpdate, ClientUpdateOwnership } from './shared/events/client';
-import { RoomEvent, SyncEvent, MessageEvent, ErrorEvent, UserEvent } from './shared/events/server';
+import { PORT, PEM_CERT, PEM_KEY, INTERVAL_ROOM_UPDATE } from './common/config';
 import RoomManager from './room';
-import { User } from './shared';
+import { User, Client, Player } from './shared';
+import Meta from './shared/meta';
+import Stream from './shared/stream';
 
 const server = https.createServer({
     cert: fs.readFileSync(PEM_CERT),
@@ -17,100 +17,158 @@ const server = https.createServer({
 
 console.log(`Listening on port ${PORT}`);
 
-const wss = new WS(server, INTERVAL_CLIENT_CHECK);
+const wss = new WS(server);
 const roomManager = new RoomManager();
 
+// Event Types
+interface ClientEvent {
+    client: Client;
+    payload: any;
+}
+
+interface ClientUserUpdate extends ClientEvent {
+    payload: { username: string };
+}
+
+interface ClientNewRoom extends ClientEvent {
+    payload: { meta: Meta; stream: Stream };
+}
+
+interface ClientJoinRoom extends ClientEvent {
+    payload: { id: string };
+}
+
+interface ClientMessage extends ClientEvent {
+    payload: { content: string };
+}
+
+interface ClientUpdateOwnership extends ClientEvent {
+    payload: { userId: string };
+}
+
+interface ClientSync extends ClientEvent {
+    payload: Player;
+}
+
+// Register event handlers
 wss.events.on('user.update', updateUser);
 wss.events.on('room.new', createRoom);
 wss.events.on('room.join', joinRoom);
 wss.events.on('room.message', messageRoom);
 wss.events.on('room.updateOwnership', updateRoomOwnership);
 wss.events.on('player.sync', syncPlayer);
-wss.events.on('heartbeat', heartbeat);
 
 function updateUser({ client, payload }: ClientUserUpdate) {
     const { username } = payload;
 
-    if (username.length > 0) {
+    if (username && username.length > 0) {
         client.name = username.slice(0, 25);
 
         const user = new User(client);
-        client.sendEvent(new UserEvent(user));
+        client.emit('user', { user });
 
         const room = roomManager.getClientRoom(client);
         if (room) {
             roomManager.updateUser(room.id, user);
-            wss.sendToRoomClients(room.id, new SyncEvent(room));
+            wss.emitToRoom(room.id, 'sync', room);
         }
     }
 }
 
 function createRoom({ client, payload }: ClientNewRoom) {
     const room = roomManager.create(client, payload);
-    client.sendEvent(new RoomEvent(room));
+    
+    // Join the Socket.io room
+    client.joinRoom(room.id);
+    
+    client.emit('room', room);
 }
 
-function joinRoom({ client, payload }: CientJoinRoom) {
+function joinRoom({ client, payload }: ClientJoinRoom) {
     const { id } = payload;
 
     const room = roomManager.join(client, id);
-    if (!room) return client.sendEvent(new ErrorEvent('room'));
+    if (!room) {
+        return client.emit('error', { type: 'room' });
+    }
 
-    wss.sendToRoomClients(room.id, new SyncEvent(room));
+    // Join the Socket.io room
+    client.joinRoom(room.id);
+
+    wss.emitToRoom(room.id, 'sync', room);
 }
 
 function messageRoom({ client, payload }: ClientMessage) {
     const room = roomManager.getClientRoom(client);
-    if (!room) return client.sendEvent(new ErrorEvent('room'));
+    if (!room) {
+        return client.emit('error', { type: 'room' });
+    }
 
     if (payload.content) {
-        const event = new MessageEvent(client, payload.content);
-        if ((event.payload.date - client.cooldown) / 1000 < 3) return client.sendEvent(new ErrorEvent('cooldown'));
+        const messageDate = Date.now();
+        if ((messageDate - client.cooldown) / 1000 < 3) {
+            return client.emit('error', { type: 'cooldown' });
+        }
 
-        wss.sendToRoomClients(room.id, event);
+        const messagePayload = {
+            user: client.id,
+            content: payload.content.substring(0, 300),
+            date: messageDate
+        };
+
+        wss.emitToRoom(room.id, 'message', messagePayload);
         client.resetCooldown();
     }
 }
 
 function updateRoomOwnership({ client, payload }: ClientUpdateOwnership) {
     const room = roomManager.getClientRoom(client);
-    if (!room) return client.sendEvent(new ErrorEvent('room'));
+    if (!room) {
+        return client.emit('error', { type: 'room' });
+    }
 
     if (payload && payload.userId && room.owner === client.id) {
         const roomUser = room.users.find(({ id, room_id }) => id === payload.userId && room_id === room.id);
 
-        if (!roomUser) return client.sendEvent(new ErrorEvent('user'));
+        if (!roomUser) {
+            return client.emit('error', { type: 'user' });
+        }
 
         const updatedRoom = roomManager.updateOwner(room.id, roomUser);
-        if (updatedRoom)
-            wss.sendToRoomClients(updatedRoom.id, new SyncEvent(updatedRoom));
+        if (updatedRoom) {
+            wss.emitToRoom(updatedRoom.id, 'sync', updatedRoom);
+        }
     }
 }
 
 function syncPlayer({ client, payload: player }: ClientSync) {
     const room = roomManager.getClientRoom(client);
-    if (!room) return client.sendEvent(new ErrorEvent('room'));
+    if (!room) {
+        return client.emit('error', { type: 'room' });
+    }
     
     if (room.owner === client.id) {
+        // Owner's sync - update room and broadcast to others
         room.player = player;
-
-        const clients = wss.getClientsByRoomId(room.id).filter(c => c.id !== client.id);
-        wss.sendToClients(clients, new SyncEvent(room));
+        
+        // Broadcast to all other clients in the room (excluding sender)
+        wss.emitToRoomExcept(room.id, client, 'sync', room);
     } else {
-        client.sendEvent(new SyncEvent(room));
+        // Non-owner trying to sync - send them the current room state
+        client.emit('sync', room);
     }
 }
 
-function heartbeat({ client }: ClientEvent) {
-    client.last_active = new Date().getTime();
-}
-
+// Periodic room cleanup - remove disconnected users
 setInterval(() => {
     roomManager.rooms = roomManager.rooms.map(room => {
         const tmp_users = room.users;
         room.users = room.users.filter(user => wss.clients.find(client => client.id === user.id));
 
-        if (JSON.stringify(room.users) !== JSON.stringify(tmp_users)) wss.sendToRoomClients(room.id, new SyncEvent(room));
+        if (JSON.stringify(room.users) !== JSON.stringify(tmp_users)) {
+            wss.emitToRoom(room.id, 'sync', room);
+        }
         return room;
     });
 }, INTERVAL_ROOM_UPDATE);
+

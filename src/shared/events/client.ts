@@ -20,7 +20,7 @@ interface ClientNewRoom extends ClientEvent {
     }
 }
 
-interface CientJoinRoom extends ClientEvent {
+interface ClientJoinRoom extends ClientEvent {
     payload: {
         id: string;
     }
@@ -46,7 +46,7 @@ export {
     ClientEvent,
     ClientUserUpdate,
     ClientNewRoom,
-    CientJoinRoom,
+    ClientJoinRoom,
     ClientMessage,
     ClientUpdateOwnership,
     ClientSync

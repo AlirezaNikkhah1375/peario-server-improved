@@ -1,35 +1,58 @@
-import WebSocket from 'ws';
+import { Socket } from 'socket.io';
 import { v4 as uuidv4 } from 'uuid';
-import { ServerEvent } from './events/server';
+import { ClientToServerEvents, ServerToClientEvents, InterServerEvents, SocketData } from './events/types';
+
+type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, InterServerEvents, SocketData>;
 
 class Client {
     public id: string;
     public name: string;
     public room_id: string = '';
-    public last_active: number;
     public cooldown: number;
 
-    private socket: WebSocket;
+    private socket: TypedSocket;
 
-    constructor(socket: WebSocket) {
+    constructor(socket: TypedSocket) {
         this.id = uuidv4();
-        this.name = `Guest${this.id.substr(0, 4)}`;
-        this.last_active = new Date().getTime();
+        this.name = `Guest${this.id.substring(0, 4)}`;
         this.socket = socket;
         this.cooldown = Date.now();
+
+        // Store client data on socket for easy access
+        socket.data.id = this.id;
+        socket.data.name = this.name;
+        socket.data.room_id = '';
+        socket.data.cooldown = this.cooldown;
     }
 
-    onMessage(callback: (data: string) => void) {
-        this.socket.on('message', callback);
+    getSocket(): TypedSocket {
+        return this.socket;
     }
 
-    sendEvent({ type, payload }: ServerEvent) {
-        this.socket.send(JSON.stringify({ type, payload }));
+    emit<E extends keyof ServerToClientEvents>(
+        event: E,
+        ...args: Parameters<ServerToClientEvents[E]>
+    ): void {
+        this.socket.emit(event, ...args);
     }
 
-    resetCooldown() {
+    joinRoom(roomId: string): void {
+        this.room_id = roomId;
+        this.socket.data.room_id = roomId;
+        this.socket.join(roomId);
+    }
+
+    leaveRoom(roomId: string): void {
+        this.socket.leave(roomId);
+        this.room_id = '';
+        this.socket.data.room_id = '';
+    }
+
+    resetCooldown(): void {
         this.cooldown = Date.now();
+        this.socket.data.cooldown = this.cooldown;
     }
 }
 
 export default Client;
+export { TypedSocket };
